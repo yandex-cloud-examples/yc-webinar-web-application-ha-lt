@@ -1,0 +1,43 @@
+uploader:
+  enabled: true
+  package: yandextank.plugins.DataUploader
+  job_name: test
+  job_dsc: ''
+  ver: ''
+  api_address: loadtesting.api.cloud.yandex.net:443
+pandora:
+  enabled: true
+  package: yandextank.plugins.Pandora
+  resources:
+    - src: https://storage.yandexcloud.net/load-generator-glv7kep9/test.hcl
+      dst: ./test.hcl
+    - src: https://storage.yandexcloud.net/load-generator-glv7kep9/test-data.csv
+      dst: ./test-data.csv
+  config_content:
+    pools:
+      - id: HTTP
+        gun:
+          type: http/scenario
+          target: test1.ft2.xpkg.ru:443
+          ssl: true
+        ammo:
+          file: test.hcl
+          type: http/scenario
+        result:
+          type: phout
+          destination: ./phout.log
+        startup:
+          type: once
+          times: 1000
+        rps:
+          - type: const
+            ops: 50
+            duration: 120s
+        discard_overflow: false
+    log:
+      level: error
+    monitoring:
+      expvar:
+        enabled: true
+        port: 1234
+core: {}

@@ -1,0 +1,115 @@
+image: docker:20.10.16
+
+stages:
+  - build
+  - deploy
+  - test
+  - clean
+
+variables:
+  TF_VAR_zones: '[ "ru-central1-a", "ru-central1-b" ]'
+  TF_VAR_todoapp_image_repository: "${CI_REGISTRY}/${CI_PROJECT_PATH}/app"
+  TF_VAR_todoapp_image_tag: "${CI_COMMIT_SHORT_SHA}"
+  TF_VAR_k8s_static_kubeconfig: "kubeconfig"
+  TF_VAR_lg_config: "lg-config.yaml"
+
+  TF_IN_AUTOMATION: 1
+  TF_HTTP_ADDRESS: "$CI_SERVER_URL/api/v4/projects/$CI_PROJECT_ID/terraform/state/default"
+  TF_HTTP_LOCK_ADDRESS: "$TF_HTTP_ADDRESS/lock"
+  TF_HTTP_LOCK_METHOD: "POST"
+  TF_HTTP_UNLOCK_ADDRESS: "$TF_HTTP_ADDRESS/lock"
+  TF_HTTP_UNLOCK_METHOD: "DELETE"
+  TF_HTTP_RETRY_WAIT_MIN: 5
+  TF_HTTP_USERNAME: "gitlab-ci-token"
+  TF_HTTP_PASSWORD: "$CI_JOB_TOKEN"
+
+  DOCKER_HOST: tcp://docker:2376
+  DOCKER_TLS_CERTDIR: "/certs"
+  DOCKER_TLS_VERIFY: 1
+  DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
+  DOCKER_DRIVER: overlay2
+
+  TOOLS_IMAGE: "${CI_REGISTRY}/${CI_PROJECT_PATH}/tools:${TF_VAR_todoapp_image_tag}"
+
+build-app:
+  stage: build
+  variables:
+    SUBDIRS: "app/todo/backend app/todo/frontend tools"
+  before_script:
+    - mkdir -p $HOME/.docker
+    - echo "$DOCKER_AUTH_CONFIG" > $HOME/.docker/config.json
+  services:
+    - docker:20.10.16-dind
+  script:
+    - >-
+      for subdir in $SUBDIRS; do
+          IMAGE="${CI_REGISTRY}/${CI_PROJECT_PATH}/${subdir}"
+          docker build --tag "${IMAGE}:${CI_COMMIT_SHORT_SHA}" "${CI_PROJECT_DIR}/${subdir}/."
+          [ -z "${CI_COMMIT_TAG}" ] || docker tag "${IMAGE}:${CI_COMMIT_SHORT_SHA}" "${IMAGE}:${CI_COMMIT_TAG}"
+      done
+    - >- 
+      for subdir in $SUBDIRS; do
+          IMAGE="${CI_REGISTRY}/${CI_PROJECT_PATH}/${subdir}"
+          docker push -a "${IMAGE}"
+      done
+  rules:
+    - if: $TF_VAR_todoapp_image_tag == '${CI_COMMIT_SHORT_SHA}' || $CI_COMMIT_TAG != null
+
+deploy:
+  stage: deploy
+  image: 
+    name: "${TOOLS_IMAGE}"
+  script:
+    - cd infra
+    - terraform init
+    - terraform apply -auto-approve
+
+test:
+  stage: test
+  image: 
+    name: "${TOOLS_IMAGE}"
+  variables: 
+    KUBECONFIG: "kubeconfig"
+    TF_VAR_lg_duration: "1500s"
+  dependencies:
+    - deploy
+  before_script: 
+    - yc config profile create sa-profile
+    - yc config set service-account-key ${YC_SERVICE_ACCOUNT_KEY_FILE}
+    - yc config set folder-id ${TF_VAR_folder_id}
+  script:
+    - cd infra
+    - terraform init -reconfigure
+    - terraform apply -replace="kubernetes_token_request_v1.admin[0]" -auto-approve
+    - kubectl -n todoapp delete pods -l app.kubernetes.io/instance=todobackend,app.kubernetes.io/name=backend
+    - kubectl -n todoapp delete pods -l app.kubernetes.io/instance=todofrontend,app.kubernetes.io/name=frontend
+    - wait-for-app.sh "https://$TF_VAR_fqdn"
+    - run-test.py --config lg-config.yaml --folder-id ${TF_VAR_folder_id} 
+        --agent-id $(terraform output -raw agent_id) --sa-json-path ${YC_SERVICE_ACCOUNT_KEY_FILE}
+    - sleep 180
+    - terraform apply -var disabled_zone="ru-central1-b" -auto-approve
+    - sleep 300
+    - terraform apply -var disabled_zone="" -auto-approve;
+    - sleep 60
+    - terraform apply -var disabled_zone="ru-central1-a" -auto-approve
+    - yc postgres cluster start-failover $(terraform output -raw db_cluster_id)
+    - sleep 900
+    - terraform apply -var disabled_zone="" -auto-approve
+    - sleep 60
+  allow_failure: true
+    
+clean:
+  stage: clean
+  image: 
+    name: "${TOOLS_IMAGE}"
+  script:
+    - cd infra
+    - terraform init -reconfigure 
+    - terraform state list | grep '^kubernetes_namespace' | cut -f 1 -d '[' | xargs -r -n 1 terraform state rm || true
+    - terraform destroy -auto-approve
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: always
+    - if: $CI_PIPELINE_SOURCE == "push"
+      when: always
+    - when: manual
