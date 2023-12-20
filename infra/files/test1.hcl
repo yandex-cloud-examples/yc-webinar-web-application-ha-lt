@@ -23,12 +23,11 @@ request "todos_new" {
   }
   preprocessor {
     mapping = {
-      t = "source.data[rand].title"
-      d = "source.data[rand].description"
+      tuple = "source.data[rand]"
     }
   }
   body = <<-EOF
-    {"title": "{{ .request.todos_new.preprocessor.t }}", "description": "{{ .request.todos_new.preprocessor.d }}", "completed": false}
+    {"title": "{{ .request.todos_new.preprocessor.tuple.title }}", "description": "{{ .request.todos_new.preprocessor.tuple.description }}", "completed": false}
   EOF
   postprocessor "var/jsonpath" {
     mapping = {
